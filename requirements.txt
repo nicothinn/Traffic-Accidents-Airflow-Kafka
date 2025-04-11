@@ -1,0 +1,13 @@
+python-dotenv
+sys
+os
+sqlalchemy
+pandas
+matplotlib
+seaborn
+numpy
+textwarap
+overpy
+tqdm
+glob
+ast
