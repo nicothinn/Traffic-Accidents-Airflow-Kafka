@@ -1,6 +1,0 @@
-.env
-venv/
-logs/
-__pycache__/
-data/*.csv
-data/
