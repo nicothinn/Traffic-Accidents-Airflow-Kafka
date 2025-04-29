@@ -7,11 +7,11 @@ import psycopg2
 def conectar_db():
     try:
         conn = psycopg2.connect(
-            dbname="Aqui_tu db",
-            user="Aqui_tu user",
-            password="Aqui_tu password",
-            host="Aqui_tu host",
-            port="Aqui_tu puerto",
+            dbname="postgres",
+            user="postgres",
+            password="postgres",
+            host="localhost",
+            port="5432",
             options="-c client_encoding=UTF8"
         )
         conn.set_client_encoding('UTF8')  # Asegurar que la codificación sea UTF-8
