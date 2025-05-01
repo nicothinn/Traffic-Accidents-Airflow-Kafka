@@ -1,34 +1,44 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+
 from datetime import datetime
 from dotenv import load_dotenv
+from pathlib import Path
 import os
+import logging
 import glob
-import pandas as pd
+import time
 import ast
-from sqlalchemy import create_engine, text
+
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
 import overpy
 from geopy.geocoders import Nominatim
 from geopy.extra.rate_limiter import RateLimiter
-import logging
+from sqlalchemy import create_engine, text
+import psycopg2
+
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-# Cargar variables de entorno desde el archivo .env
-load_dotenv()
+load_dotenv(dotenv_path=Path("/opt/airflow/.env"))
+            
 # Credenciales para ambas bases de datos
 DB_HOST = os.getenv("DB_HOST")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME_SOURCE =os.getenv("DB_NAME_SOURCE", "CrashTraffic")
-DB_NAME_DIM = os.getenv("DB_NAME_DIM", "CrashTrafficDim")
+DB_NAME_SOURCE = "postgres"
+DB_NAME_DIM = "CrashTraffic_Dimensional"
 
 # Crear URLs de conexión para SQLAlchemy
 SOURCE_DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME_SOURCE}"
 DIM_DB_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME_DIM}"
+
 
 # Funciones para cada tarea
 def setup_tables():
@@ -144,150 +154,6 @@ def setup_tables():
         log.info("Conexión cerrada en setup_tables.")
 
 
-def extract():
-    source_engine = None
-    dim_engine = None
-    src_conn = None
-    dim_conn = None
-    try:
-        source_engine = create_engine(SOURCE_DB_URL)
-        dim_engine = create_engine(DIM_DB_URL)
-        src_conn = source_engine.connect()
-        dim_conn = dim_engine.connect()
-
-        # dim_fecha
-        result = src_conn.execute(text("""
-        SELECT DISTINCT
-            EXTRACT(DAY FROM crash_date) AS Día,
-            EXTRACT(MONTH FROM crash_date) AS Mes,
-            EXTRACT(YEAR FROM crash_date) AS Año,
-            TO_CHAR(crash_date, 'Dy') AS Día_Semana,
-            CAST(crash_date AS TIME) AS Hora
-        FROM public.accidentes
-        """)).fetchall()
-        for row in result:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_fecha (Día, Mes, Año, Día_Semana, Hora)
-                VALUES (:dia, :mes, :ano, :dia_semana, :hora)
-                ON CONFLICT DO NOTHING
-                """),
-                {"dia": row[0], "mes": row[1], "ano": row[2], "dia_semana": row[3], "hora": row[4]}
-            )
-
-        # dim_ubicacion
-        result = src_conn.execute(text("""
-        SELECT DISTINCT
-            Start_Lat::DECIMAL(10,6) AS Latitud,
-            Start_Lng::DECIMAL(10,6) AS Longitud,
-            intersection_related AS Intersección
-        FROM public.accidentes
-        """)).fetchall()
-        for row in result:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_ubicacion (Latitud, Longitud, Intersección)
-                VALUES (:latitud, :longitud, :interseccion)
-                ON CONFLICT DO NOTHING
-                """),
-                {"latitud": row[0], "longitud": row[1], "interseccion": row[2]}
-            )
-
-        # dim_clima
-        result = src_conn.execute(text("""
-        SELECT DISTINCT weather_condition AS Condición_Climática
-        FROM public.accidentes
-        """)).fetchall()
-        for row in result:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_clima (Condición_Climática)
-                VALUES (:condicion)
-                ON CONFLICT DO NOTHING
-                """),
-                {"condicion": row[0]}
-            )
-
-        # dim_iluminacion
-        result = src_conn.execute(text("""
-        SELECT DISTINCT lighting_condition AS Condición_Iluminación
-        FROM public.accidentes
-        """)).fetchall()
-        for row in result:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_iluminacion (Condición_Iluminación)
-                VALUES (:condicion)
-                ON CONFLICT DO NOTHING
-                """),
-                {"condicion": row[0]}
-            )
-
-        # dim_condicion_camino
-        result = src_conn.execute(text("""
-        SELECT DISTINCT
-            roadway_surface_cond AS Superficie_Carretera,
-            road_defect AS Defecto_Carretera
-        FROM public.accidentes
-        """)).fetchall()
-        for row in result:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_condicion_camino (Superficie_Carretera, Defecto_Carretera)
-                VALUES (:superficie, :defecto)
-                ON CONFLICT DO NOTHING
-                """),
-                {"superficie": row[0], "defecto": row[1]}
-            )
-
-        # dim_tipo_accidente
-        result = src_conn.execute(text("""
-        SELECT DISTINCT
-            first_crash_type AS Tipo_Primer_Choque,
-            trafficway_type AS Tipo_Vía,
-            alignment AS Alineación,
-            most_severe_injury AS Nivel_Lesión
-        FROM public.accidentes
-        """)).fetchall()
-        for row in result:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_tipo_accidente (Tipo_Primer_Choque, Tipo_Vía, Alineación, Nivel_Lesión)
-                VALUES (:tipo_choque, :tipo_via, :alineacion, :nivel_lesion)
-                ON CONFLICT DO NOTHING
-                """),
-                {"tipo_choque": row[0], "tipo_via": row[1], "alineacion": row[2], "nivel_lesion": row[3]}
-            )
-
-        # dim_contribuyente_principal
-        result = src_conn.execute(text("""
-        SELECT DISTINCT prim_contributory_cause AS Causa_Principal
-        FROM public.accidentes
-        """)).fetchall()
-        for row in result:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_contribuyente_principal (Causa_Principal)
-                VALUES (:causa)
-                ON CONFLICT DO NOTHING
-                """),
-                {"causa": row[0]}
-            )
-
-        log.info("Extracción completada exitosamente.")
-    except Exception as e:
-        log.error(f"Error en extract: {str(e)}", exc_info=True)
-        raise
-    finally:
-        if src_conn:
-            src_conn.close()
-        if dim_conn:
-            dim_conn.close()
-        if source_engine:
-            source_engine.dispose()
-        if dim_engine:
-            dim_engine.dispose()
-        log.info("Conexiones cerradas en extract.")
 
 
 def extract_bbox_osm():
@@ -295,6 +161,13 @@ def extract_bbox_osm():
     log = logging.getLogger(__name__)
 
     raw_folder = "/opt/airflow/data/raw/"
+    os.makedirs(raw_folder, exist_ok=True)  
+
+    check_file = os.path.join(raw_folder, "bbox_35.0_-81.0_osm.csv")
+    if os.path.exists(check_file):
+        log.info(f"El archivo {check_file} ya existe. Omitiendo extract_bbox_osm().")
+        return
+    
     bbox_df = pd.DataFrame([
         [35.0, -81.0], [32.5, -97.0], [34.0, -118.5], [29.5, -95.5],
         [34.5, -82.5], [37.5, -122.5], [35.5, -79.0], [33.5, -118.5],
@@ -480,6 +353,11 @@ def transform_bbox_data():
 
     raw_folder = "/opt/airflow/data/raw/"
     processed_folder = "/opt/airflow/data/processed/"
+    final_path = os.path.join(processed_folder, "combined_bbox_summary_final.csv")
+    if os.path.exists(final_path):
+        log.info(f"Archivo {final_path} ya existe. Omitiendo transform_bbox_data().")
+        return
+    
     files = glob.glob(os.path.join(raw_folder, "bbox*_osm.csv"))
 
     geolocator = Nominatim(user_agent="bbox_locator")
@@ -591,136 +469,447 @@ def transform_bbox_data():
     log.info(f"Archivo final guardado en '{output_path}'")
 
 def merge_accidents_with_api():
+    from sqlalchemy import create_engine, text
+    import pandas as pd
+    import logging
+
+    log = logging.getLogger(__name__)
+    source_engine = create_engine(SOURCE_DB_URL)
+
     try:
-        engine = create_engine(SOURCE_DB_URL)
-        conn = engine.connect()
+        with source_engine.begin() as conn:
+            log.info("Creando tabla accidentes_final si no existe...")
+            create_table_sql = """
+            CREATE TABLE IF NOT EXISTS accidentes_final (
+                id INTEGER PRIMARY KEY,
+                crash_date TIMESTAMP,
+                traffic_control_device TEXT,
+                weather_condition TEXT,
+                lighting_condition TEXT,
+                first_crash_type TEXT,
+                trafficway_type TEXT,
+                alignment TEXT,
+                roadway_surface_cond TEXT,
+                road_defect TEXT,
+                crash_type TEXT,
+                intersection_related CHAR(1),
+                damage TEXT,
+                prim_contributory_cause TEXT,
+                num_units INT,
+                most_severe_injury VARCHAR,
+                injuries_total FLOAT,
+                injuries_fatal FLOAT,
+                injuries_incapacitating FLOAT,
+                injuries_non_incapacitating FLOAT,
+                injuries_reported_not_evident FLOAT,
+                injuries_no_indication FLOAT,
+                crash_hour INT,
+                crash_day_of_week INT,
+                crash_month INT,
+                start_lat FLOAT,
+                start_lng FLOAT,
+                lat_bin FLOAT,
+                lng_bin FLOAT,
+                bbox_label TEXT,
+                category_hospital INT,
+                category_school INT,
+                crossing_combinations INT,
+                crossing_marked INT,
+                crossing_uncontrolled INT,
+                crossing_unknown INT,
+                crossing_unmarked INT,
+                crossing_zebra INT,
+                traffic_signals_bridge INT,
+                traffic_signals_emergency INT,
+                traffic_signals_level_crossing INT,
+                traffic_signals_pedestrian_crossing INT,
+                traffic_signals_ramp_meter INT,
+                traffic_signals_signal INT,
+                traffic_signals_traffic_lights INT,
+                traffic_signals_unknown INT,
+                aprox_city TEXT,
+                aprox_county TEXT,
+                aprox_state TEXT,
+                aprox_postcode TEXT
+            );
+            """
+            conn.execute(text(create_table_sql))
 
-        log.info("Cargando datos de accidentes desde la base de datos...")
-        df_accidents = pd.read_sql("SELECT * FROM accidentes", conn)
+        with source_engine.connect() as conn:
+            log.info("Consultando datos de accidentes...")
+            result = conn.execute(text("SELECT * FROM accidentes"))
+            rows = result.fetchall()
+            columns = result.keys()
+            df_accidents = pd.DataFrame(rows, columns=columns)
 
-        df_accidents['lat_bin'] = (df_accidents['start_lat'] // 0.5) * 0.5
-        df_accidents['lng_bin'] = (df_accidents['start_lng'] // 0.5) * 0.5
-        df_accidents['bbox_label'] = df_accidents['lat_bin'].astype(str) + "_" + df_accidents['lng_bin'].astype(str)
+            log.info("Leyendo archivo CSV de la API...")
+            api_df = pd.read_csv("data/processed/combined_bbox_summary_final.csv")
 
-        log.info("Leyendo datos de infraestructura desde CSV de la API...")
-        api_df = pd.read_csv("data/processed/combined_bbox_summary_with_city.csv")
+            # Procesamiento
+            df_accidents['start_lat'] = df_accidents['start_lat'].astype(float)
+            df_accidents['start_lng'] = df_accidents['start_lng'].astype(float)
+            df_accidents['lat_bin'] = (df_accidents['start_lat'] // 0.5) * 0.5
+            df_accidents['lng_bin'] = (df_accidents['start_lng'] // 0.5) * 0.5
+            df_accidents['bbox_label'] = 'bbox_' + df_accidents['lat_bin'].astype(str) + '_' + df_accidents['lng_bin'].astype(str)
 
-        columnas_utiles = [
-            'bbox_label',
-            'category_hospital', 'category_school',
-            'crossing_combinations', 'crossing_marked', 'crossing_uncontrolled',
-            'crossing_unknown', 'crossing_unmarked', 'crossing_zebra',
-            'traffic_signals_bridge', 'traffic_signals_emergency',
-            'traffic_signals_level_crossing', 'traffic_signals_pedestrian_crossing',
-            'traffic_signals_ramp_meter', 'traffic_signals_signal',
-            'traffic_signals_traffic_lights', 'traffic_signals_unknown',
-            'city', 'county', 'state', 'postcode'
-        ]
+            api_df = api_df.rename(columns={
+                "city": "aprox_city",
+                "county": "aprox_county",
+                "state": "aprox_state",
+                "postcode": "aprox_postcode"
+            })
 
-        api_df = api_df[columnas_utiles]
+            log.info("Realizando merge con datos de la API...")
+            merged_df = pd.merge(df_accidents, api_df, on="bbox_label", how="inner")
 
-        # Renombrar campos de ciudad para evitar colisión de nombres
-        api_df = api_df.rename(columns={
-            "city": "aprox_city",
-            "county": "aprox_county",
-            "state": "aprox_state",
-            "postcode": "aprox_postcode"
-        })
+            log.info("Verificando registros ya existentes en accidentes_final...")
+            result_ids = conn.execute(text("SELECT id FROM accidentes_final"))
+            existing_ids = set(row[0] for row in result_ids.fetchall())
+            merged_df = merged_df[~merged_df["id"].isin(existing_ids)]
 
-        log.info("Haciendo el merge entre accidentes y datos de la API por bbox_label...")
-        merged_df = pd.merge(df_accidents, api_df, on="bbox_label", how="inner")
+            if merged_df.empty:
+                log.info("No hay registros nuevos para insertar.")
+                return
 
-        log.info("Guardando el resultado como nueva tabla 'accidentes_final'...")
-        merged_df.to_sql("accidentes_final", conn, if_exists="replace", index=False)
+            columnas_finales = [
+                "id", "crash_date", "traffic_control_device", "weather_condition", "lighting_condition",
+                "first_crash_type", "trafficway_type", "alignment", "roadway_surface_cond", "road_defect",
+                "crash_type", "intersection_related", "damage", "prim_contributory_cause", "num_units",
+                "most_severe_injury", "injuries_total", "injuries_fatal", "injuries_incapacitating",
+                "injuries_non_incapacitating", "injuries_reported_not_evident", "injuries_no_indication",
+                "crash_hour", "crash_day_of_week", "crash_month", "start_lat", "start_lng",
+                "lat_bin", "lng_bin", "bbox_label", "category_hospital", "category_school",
+                "crossing_combinations", "crossing_marked", "crossing_uncontrolled", "crossing_unknown",
+                "crossing_unmarked", "crossing_zebra", "traffic_signals_bridge", "traffic_signals_emergency",
+                "traffic_signals_level_crossing", "traffic_signals_pedestrian_crossing",
+                "traffic_signals_ramp_meter", "traffic_signals_signal", "traffic_signals_traffic_lights",
+                "traffic_signals_unknown", "aprox_city", "aprox_county", "aprox_state", "aprox_postcode"
+            ]
+            merged_df = merged_df[columnas_finales]
 
-        log.info("Tabla 'accidentes_final' creada con éxito.")
+            log.info(f"Insertando {len(merged_df)} registros nuevos en accidentes_final...")
+            insert_query = f"""
+                INSERT INTO accidentes_final ({', '.join(columnas_finales)})
+                VALUES ({', '.join([f':{col}' for col in columnas_finales])})
+                ON CONFLICT (id) DO NOTHING;
+            """
+            for _, row in merged_df.iterrows():
+                conn.execute(text(insert_query), row.to_dict())
 
     except Exception as e:
         log.error(f"Error en merge_accidents_with_api: {str(e)}", exc_info=True)
         raise
 
     finally:
-        if conn:
-            conn.close()
-        if engine:
-            engine.dispose()
-        log.info("Conexión cerrada en merge_accidents_with_api.")
+        source_engine.dispose()
+        log.info("Conexión cerrada.")
 
-def load(**context):
-    dim_engine = None
-    dim_conn = None
+
+def load_from_accidentes_final():
+    log = logging.getLogger(__name__)
+    source_engine = dim_engine = None
+    source_conn = dim_conn = None
     try:
-        log.info("Contexto recibido en load: %s", context)
-        if not context:
-            raise ValueError("El contexto no se pasó correctamente a la función load.")
-
+        source_engine = create_engine(SOURCE_DB_URL)
         dim_engine = create_engine(DIM_DB_URL)
+        source_conn = source_engine.connect()
         dim_conn = dim_engine.connect()
 
-        task_instance = context.get('task_instance')
-        if not task_instance:
-            raise ValueError("No se encontró 'task_instance' en el contexto.")
+        log.info("Verificando si hay datos en accidentes_final...")
+        result = source_conn.execute(text("SELECT COUNT(*) FROM accidentes_final"))
+        count = result.scalar()
+        if count == 0:
+            log.info("No hay datos en accidentes_final. Finalizando función.")
+            return
 
-        hechos_batches = task_instance.xcom_pull(task_ids='transform')
-        infraestructura_batches = task_instance.xcom_pull(task_ids='api_transform_bbox_data')
+        # Verificamos si ya hay datos en dim_fecha
+        result = dim_conn.execute(text("SELECT COUNT(*) FROM dim_fecha"))
+        dim_fecha_count = result.scalar()
 
-        if not hechos_batches:
-            raise ValueError("No se encontraron datos en XCom para la tarea 'transform'.")
+        log.info("Consultando registros de accidentes_final...")
+        rows = source_conn.execute(text("SELECT * FROM accidentes_final")).fetchall()
 
-        if not infraestructura_batches:
-            raise ValueError("No se encontraron datos en XCom para la tarea 'api_transform_bbox_data'.")
+        if dim_fecha_count == 0:
+            log.info("Insertando dimensiones en lote...")
+            dim_conn.execute(text("""INSERT INTO dim_fecha (Día, Mes, Año, Día_Semana, Hora) VALUES (:dia, :mes, :ano, :dia_semana, :hora) ON CONFLICT DO NOTHING"""),
+                [{
+                    "dia": row.crash_date.day,
+                    "mes": row.crash_date.month,
+                    "ano": row.crash_date.year,
+                    "dia_semana": row.crash_date.strftime("%A"),
+                    "hora": row.crash_date.time()
+                } for row in rows])
 
-        for batch in hechos_batches:
-            dim_conn.execute(
-                text("""
-                INSERT INTO hechos_accidentes (
-                    ID_Hecho, Fecha_ID, Ubicación_ID, Clima_ID, Iluminación_ID, Condición_Camino_ID,
-                    Tipo_Accidente_ID, Contribuyente_Principal_ID, Unidades_Involucradas, Total_Lesiones,
-                    Fatalidades, Incapacitantes, No_Incapacitantes, Reportadas_No_Evidentes, Sin_Indicación
-                )
-                VALUES (:id, :fecha_id, :ubicacion_id, :clima_id, :iluminacion_id, :condicion_camino_id,
-                        :tipo_accidente_id, :contribuyente_id, :unidades, :total_lesiones, :fatalidades,
-                        :incapacitantes, :no_incapacitantes, :reportadas_no_evidentes, :sin_indicacion)
-                ON CONFLICT (ID_Hecho) DO NOTHING
-                """),
-                batch
-            )
+            dim_conn.execute(text("""INSERT INTO dim_ubicacion (Latitud, Longitud, Intersección, Approx_City, Approx_County, Approx_State, Approx_Postcode)
+                       VALUES (:lat, :lng, :inter, :city, :county, :state, :postcode) ON CONFLICT DO NOTHING"""),
+                [{
+                    "lat": row.start_lat,
+                    "lng": row.start_lng,
+                    "inter": row.intersection_related,
+                    "city": row.aprox_city,
+                    "county": row.aprox_county,
+                    "state": row.aprox_state,
+                    "postcode": row.aprox_postcode
+                } for row in rows])
 
-        for infra_batch in infraestructura_batches:
-            dim_conn.execute(
-                text("""
-                INSERT INTO dim_infraestructura (
-                    BBox_Label, Category_Hospital, Category_School, Crossing_Combinations, Crossing_Marked,
-                    Crossing_Uncontrolled, Crossing_Unknown, Crossing_Unmarked, Crossing_Zebra,
-                    Traffic_Signals_Bridge, Traffic_Signals_Emergency, Traffic_Signals_Level_Crossing,
-                    Traffic_Signals_Pedestrian_Crossing, Traffic_Signals_Ramp_Meter, Traffic_Signals_Signal,
-                    Traffic_Signals_Traffic_Lights, Traffic_Signals_Unknown
-                )
+            dim_conn.execute(text("""INSERT INTO dim_clima (Condición_Climática) VALUES (:cond) ON CONFLICT DO NOTHING"""),
+                [{"cond": row.weather_condition} for row in rows])
+
+            dim_conn.execute(text("""INSERT INTO dim_iluminacion (Condición_Iluminación) VALUES (:cond) ON CONFLICT DO NOTHING"""),
+                [{"cond": row.lighting_condition} for row in rows])
+
+            dim_conn.execute(text("""INSERT INTO dim_contribuyente_principal (Causa_Principal) VALUES (:causa) ON CONFLICT DO NOTHING"""),
+                [{"causa": row.prim_contributory_cause} for row in rows])
+
+            dim_conn.execute(text("""INSERT INTO dim_condicion_camino (Superficie_Carretera, Defecto_Carretera)
+                       VALUES (:superf, :defec) ON CONFLICT DO NOTHING"""),
+                [{"superf": row.roadway_surface_cond, "defec": row.road_defect} for row in rows])
+
+            dim_conn.execute(text("""INSERT INTO dim_tipo_accidente (Tipo_Primer_Choque, Tipo_Vía, Alineación, Nivel_Lesión)
+                       VALUES (:choque, :via, :alinea, :lesion) ON CONFLICT DO NOTHING"""),
+                [{
+                    "choque": row.first_crash_type,
+                    "via": row.trafficway_type,
+                    "alinea": row.alignment,
+                    "lesion": row.most_severe_injury
+                } for row in rows])
+
+            dim_conn.execute(text("""INSERT INTO dim_infraestructura (
+                BBox_Label, Category_Hospital, Category_School, Crossing_Combinations,
+                Crossing_Marked, Crossing_Uncontrolled, Crossing_Unknown, Crossing_Unmarked,
+                Crossing_Zebra, Traffic_Signals_Bridge, Traffic_Signals_Emergency,
+                Traffic_Signals_Level_Crossing, Traffic_Signals_Pedestrian_Crossing,
+                Traffic_Signals_Ramp_Meter, Traffic_Signals_Signal, Traffic_Signals_Traffic_Lights,
+                Traffic_Signals_Unknown) 
                 VALUES (
-                    :bbox_label, :category_hospital, :category_school, :crossing_combinations,
-                    :crossing_marked, :crossing_uncontrolled, :crossing_unknown, :crossing_unmarked,
-                    :crossing_zebra, :traffic_signals_bridge, :traffic_signals_emergency,
-                    :traffic_signals_level_crossing, :traffic_signals_pedestrian_crossing,
-                    :traffic_signals_ramp_meter, :traffic_signals_signal, :traffic_signals_traffic_lights,
-                    :traffic_signals_unknown
-                )
-                ON CONFLICT (BBox_Label) DO NOTHING
-                """),
-                infra_batch
-            )
+                :bbox, :hosp, :school, :comb, :marked, :uncontrolled, :unknown, :unmarked,
+                :zebra, :bridge, :emerg, :level, :pedes, :ramp, :signal, :traffic, :ts_unknown) 
+                ON CONFLICT DO NOTHING"""),
+                [{
+                    "bbox": row.bbox_label,
+                    "hosp": row.category_hospital,
+                    "school": row.category_school,
+                    "comb": row.crossing_combinations,
+                    "marked": row.crossing_marked,
+                    "uncontrolled": row.crossing_uncontrolled,
+                    "unknown": row.crossing_unknown,
+                    "unmarked": row.crossing_unmarked,
+                    "zebra": row.crossing_zebra,
+                    "bridge": row.traffic_signals_bridge,
+                    "emerg": row.traffic_signals_emergency,
+                    "level": row.traffic_signals_level_crossing,
+                    "pedes": row.traffic_signals_pedestrian_crossing,
+                    "ramp": row.traffic_signals_ramp_meter,
+                    "signal": row.traffic_signals_signal,
+                    "traffic": row.traffic_signals_traffic_lights,
+                    "ts_unknown": row.traffic_signals_unknown
+                } for row in rows])
 
-        log.info("Carga completada exitosamente.")
+        log.info("Dimensiones listas. Preparando inserción en hechos_accidentes...")
+        hechos_batch = []
+        for row in rows:
+            hechos_batch.append({
+                "id": row.id,
+                "dia": row.crash_date.day,
+                "mes": row.crash_date.month,
+                "ano": row.crash_date.year,
+                "dia_semana": row.crash_date.strftime("%A"),
+                "hora": row.crash_date.time(),
+                "lat": row.start_lat,
+                "lng": row.start_lng,
+                "inter": row.intersection_related,
+                "city": row.aprox_city,
+                "county": row.aprox_county,
+                "state": row.aprox_state,
+                "postcode": row.aprox_postcode,
+                "weather": row.weather_condition,
+                "light": row.lighting_condition,
+                "superf": row.roadway_surface_cond,
+                "defect": row.road_defect,
+                "choque": row.first_crash_type,
+                "via": row.trafficway_type,
+                "alinea": row.alignment,
+                "lesion": row.most_severe_injury,
+                "causa": row.prim_contributory_cause,
+                "units": row.num_units,
+                "total": row.injuries_total,
+                "fatal": row.injuries_fatal,
+                "incap": row.injuries_incapacitating,
+                "no_incap": row.injuries_non_incapacitating,
+                "report": row.injuries_reported_not_evident,
+                "none": row.injuries_no_indication
+            })
+
+        for row in hechos_batch:
+            dim_conn.execute(text("""
+                INSERT INTO hechos_accidentes (
+                    ID_Hecho, Fecha_ID, Ubicación_ID, Clima_ID, Iluminación_ID,
+                    Condición_Camino_ID, Tipo_Accidente_ID, Contribuyente_Principal_ID,
+                    Unidades_Involucradas, Total_Lesiones, Fatalidades, Incapacitantes,
+                    No_Incapacitantes, Reportadas_No_Evidentes, Sin_Indicación
+                )
+                SELECT :id, f.Fecha_ID, u.Ubicación_ID, c.Clima_ID, i.Iluminación_ID,
+                       cc.Condición_Camino_ID, t.Tipo_Accidente_ID, cp.Contribuyente_Principal_ID,
+                       :units, :total, :fatal, :incap, :no_incap, :report, :none
+                FROM dim_fecha f, dim_ubicacion u, dim_clima c, dim_iluminacion i,
+                     dim_condicion_camino cc, dim_tipo_accidente t, dim_contribuyente_principal cp
+                WHERE
+                    f.Día = :dia AND f.Mes = :mes AND f.Año = :ano AND f.Día_Semana = :dia_semana AND f.Hora = :hora AND
+                    u.Latitud = :lat AND u.Longitud = :lng AND u.Intersección = :inter AND
+                    u.Approx_City = :city AND u.Approx_County = :county AND u.Approx_State = :state AND u.Approx_Postcode = :postcode AND
+                    c.Condición_Climática = :weather AND
+                    i.Condición_Iluminación = :light AND
+                    cc.Superficie_Carretera = :superf AND cc.Defecto_Carretera = :defect AND
+                    t.Tipo_Primer_Choque = :choque AND t.Tipo_Vía = :via AND t.Alineación = :alinea AND t.Nivel_Lesión = :lesion AND
+                    cp.Causa_Principal = :causa
+                ON CONFLICT DO NOTHING
+            """), row)
+
+        log.info("Carga completa desde accidentes_final.")
 
     except Exception as e:
-        log.error(f"Error en load: {str(e)}", exc_info=True)
+        log.error(f"Error en load_from_accidentes_final: {str(e)}", exc_info=True)
         raise
+
     finally:
+        if source_conn:
+            source_conn.close()
         if dim_conn:
             dim_conn.close()
+        if source_engine:
+            source_engine.dispose()
         if dim_engine:
             dim_engine.dispose()
-        log.info("Conexión cerrada en load.")
+        log.info("Conexiones cerradas.")
 
+def insert_hechos_accidentes_optimizado(rows, dim_conn):
+    log = logging.getLogger(__name__)
+    log.info("Cargando IDs de dimensiones en memoria...")
+
+    def build_dict(query, key_cols, value_col):
+        result = dim_conn.execute(text(query)).mappings().all()
+        return {
+            tuple(row[col] for col in key_cols): row[value_col] for row in result
+        }
+
+    fecha_dict = build_dict(
+        "SELECT fecha_id, día, mes, año, día_semana, hora FROM dim_fecha",
+        ["día", "mes", "año", "día_semana", "hora"], "fecha_id")
+
+    ubicacion_dict = build_dict(
+        """SELECT ubicación_id, latitud, longitud, intersección,
+                  approx_city, approx_county, approx_state, approx_postcode
+           FROM dim_ubicacion""",
+        ["latitud", "longitud", "intersección", "approx_city", "approx_county", "approx_state", "approx_postcode"],
+        "ubicación_id")
+
+    clima_dict = build_dict(
+        "SELECT clima_id, condición_climática FROM dim_clima",
+        ["condición_climática"], "clima_id")
+
+    iluminacion_dict = build_dict(
+        "SELECT iluminación_id, condición_iluminación FROM dim_iluminacion",
+        ["condición_iluminación"], "iluminación_id")
+
+    camino_dict = build_dict(
+        "SELECT condición_camino_id, superficie_carretera, defecto_carretera FROM dim_condicion_camino",
+        ["superficie_carretera", "defecto_carretera"], "condición_camino_id")
+
+    tipo_dict = build_dict(
+        "SELECT tipo_accidente_id, tipo_primer_choque, tipo_vía, alineación, nivel_lesión FROM dim_tipo_accidente",
+        ["tipo_primer_choque", "tipo_vía", "alineación", "nivel_lesión"], "tipo_accidente_id")
+
+    causa_dict = build_dict(
+        "SELECT contribuyente_principal_id, causa_principal FROM dim_contribuyente_principal",
+        ["causa_principal"], "contribuyente_principal_id")
+
+    log.info("Construyendo registros para hechos_accidentes...")
+    hechos_batch = []
+
+    for row in rows:
+        hechos_batch.append({
+            "id": row.id,
+            "fecha_id": fecha_dict.get((
+                row.crash_date.day,
+                row.crash_date.month,
+                row.crash_date.year,
+                row.crash_date.strftime("%A"),
+                row.crash_date.time()
+            )),
+            "ubicacion_id": ubicacion_dict.get((
+                row.start_lat, row.start_lng, row.intersection_related,
+                row.aprox_city, row.aprox_county, row.aprox_state, row.aprox_postcode
+            )),
+            "clima_id": clima_dict.get((row.weather_condition,)),
+            "iluminacion_id": iluminacion_dict.get((row.lighting_condition,)),
+            "condicion_camino_id": camino_dict.get((row.roadway_surface_cond, row.road_defect)),
+            "tipo_accidente_id": tipo_dict.get((
+                row.first_crash_type, row.trafficway_type,
+                row.alignment, row.most_severe_injury
+            )),
+            "contribuyente_id": causa_dict.get((row.prim_contributory_cause,)),
+            "unidades": row.num_units,
+            "total_lesiones": row.injuries_total,
+            "fatalidades": row.injuries_fatal,
+            "incapacitantes": row.injuries_incapacitating,
+            "no_incapacitantes": row.injuries_non_incapacitating,
+            "reportadas_no_evidentes": row.injuries_reported_not_evident,
+            "sin_indicacion": row.injuries_no_indication
+        })
+
+    log.info(f"Insertando {len(hechos_batch)} registros en hechos_accidentes...")
+    dim_conn.execute(text("""
+        INSERT INTO hechos_accidentes (
+            id_hecho, fecha_id, ubicación_id, clima_id, iluminación_id,
+            condición_camino_id, tipo_accidente_id, contribuyente_principal_id,
+            unidades_involucradas, total_lesiones, fatalidades, incapacitantes,
+            no_incapacitantes, reportadas_no_evidentes, sin_indicación
+        ) VALUES (
+            :id, :fecha_id, :ubicacion_id, :clima_id, :iluminacion_id,
+            :condicion_camino_id, :tipo_accidente_id, :contribuyente_id,
+            :unidades, :total_lesiones, :fatalidades, :incapacitantes,
+            :no_incapacitantes, :reportadas_no_evidentes, :sin_indicacion
+        )
+        ON CONFLICT (id_hecho) DO NOTHING
+    """), hechos_batch)
+
+    log.info("Carga optimizada de hechos_accidentes finalizada.")
+
+
+def task_insert_hechos_accidentes_optimizado():
+    log = logging.getLogger(__name__)
+    source_engine = dim_engine = None
+    source_conn = dim_conn = None
+    try:
+        # Crear conexiones
+        source_engine = create_engine(SOURCE_DB_URL)
+        dim_engine = create_engine(DIM_DB_URL)
+        source_conn = source_engine.connect()
+        dim_conn = dim_engine.connect()
+
+        # Obtener datos
+        log.info("Extrayendo registros de accidentes_final...")
+        rows = source_conn.execute(text("SELECT * FROM accidentes_final")).fetchall()
+        if not rows:
+            log.info("No hay registros para insertar.")
+            return
+
+        # Llamar a la función optimizada
+        insert_hechos_accidentes_optimizado(rows, dim_conn)
+
+    except Exception as e:
+        log.error(f"Error en task_insert_hechos_accidentes_optimizado: {str(e)}", exc_info=True)
+        raise
+    finally:
+        if source_conn:
+            source_conn.close()
+        if dim_conn:
+            dim_conn.close()
+        if source_engine:
+            source_engine.dispose()
+        if dim_engine:
+            dim_engine.dispose()
+        log.info("Conexiones cerradas en insert_hechos.")
 
 # Configuración por defecto del DAG
 default_args = {
@@ -743,39 +932,45 @@ with DAG(
         python_callable=setup_tables
     )
 
-    # ETL para dataset de accidentes (base de datos)
-    task_extract = PythonOperator(
-        task_id='extract',
-        python_callable=extract
+    task_transform_accidents = PythonOperator(
+        task_id='transform_accidents',
+        python_callable=transform 
     )
 
-    task_transform = PythonOperator(
-        task_id='transform',
-        python_callable=transform
-    )
-
-    # ETL para datos de infraestructura (API)
     task_api_extract = PythonOperator(
-        task_id='api_extract_bbox_osm',
+        task_id='api_extractation',
         python_callable=extract_bbox_osm
     )
 
     task_api_transform = PythonOperator(
-        task_id='api_transform_bbox_data',
+        task_id='api_transform',
         python_callable=transform_bbox_data
     )
 
-    # Carga final en el modelo dimensional
-    task_load = PythonOperator(
-        task_id='load',
-        python_callable=load,
-        provide_context=True
+    task_merge = PythonOperator(
+        task_id='merge',
+        python_callable=merge_accidents_with_api,
+        provide_context=True,
+        trigger_rule=TriggerRule.ALL_SUCCESS 
     )
 
-    # Definir dependencias
-    task_setup_tables >> [task_extract, task_api_extract]
+    task_load = PythonOperator(
+        task_id='load',
+        python_callable=load_from_accidentes_final,
+        provide_context=True,
+        trigger_rule=TriggerRule.ALL_SUCCESS  
+    )
 
-    task_extract >> task_transform
+    task_insert_hechos = PythonOperator(
+        task_id='insert_hechos',
+        python_callable=task_insert_hechos_accidentes_optimizado,
+        provide_context=True,
+        trigger_rule=TriggerRule.ALL_SUCCESS  
+    )
+
+
+    # Flujo del DAG
+    task_setup_tables >> [task_transform_accidents, task_api_extract]
     task_api_extract >> task_api_transform
-
-    [task_transform, task_api_transform] >> task_load
+    [task_transform_accidents, task_api_transform] >> task_merge
+    task_merge >> task_load >> task_insert_hechos
