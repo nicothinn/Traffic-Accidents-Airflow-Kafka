@@ -98,7 +98,8 @@ def setup_tables():
         );
 
         CREATE TABLE IF NOT EXISTS dim_infraestructura (
-            BBox_Label VARCHAR(50) PRIMARY KEY,
+            Infraestructura_ID SERIAL PRIMARY KEY,
+            BBox_Label VARCHAR(50) UNIQUE,
             Category_Hospital INTEGER,
             Category_School INTEGER,
             Crossing_Combinations INTEGER,
@@ -126,6 +127,7 @@ def setup_tables():
             Condición_Camino_ID INTEGER,
             Tipo_Accidente_ID INTEGER,
             Contribuyente_Principal_ID INTEGER,
+            Infraestructura_ID INTEGER,
             Unidades_Involucradas INTEGER,
             Total_Lesiones INTEGER,
             Fatalidades INTEGER,
@@ -139,7 +141,8 @@ def setup_tables():
             FOREIGN KEY (Iluminación_ID) REFERENCES dim_iluminacion(Iluminación_ID),
             FOREIGN KEY (Condición_Camino_ID) REFERENCES dim_condicion_camino(Condición_Camino_ID),
             FOREIGN KEY (Tipo_Accidente_ID) REFERENCES dim_tipo_accidente(Tipo_Accidente_ID),
-            FOREIGN KEY (Contribuyente_Principal_ID) REFERENCES dim_contribuyente_principal(Contribuyente_Principal_ID)
+            FOREIGN KEY (Contribuyente_Principal_ID) REFERENCES dim_contribuyente_principal(Contribuyente_Principal_ID),
+            FOREIGN KEY (Infraestructura_ID) REFERENCES dim_infraestructura(Infraestructura_ID)
         );
         """))
         log.info("Tablas creadas exitosamente.")
@@ -152,6 +155,7 @@ def setup_tables():
         if engine:
             engine.dispose()
         log.info("Conexión cerrada en setup_tables.")
+
 
 
 
@@ -347,6 +351,15 @@ def transform():
             dim_engine.dispose()
         log.info("Conexiones cerradas en transform.")
 
+import os
+import glob
+import logging
+import pandas as pd
+import ast
+from geopy.geocoders import Nominatim
+from geopy.extra.rate_limiter import RateLimiter
+
+
 def transform_bbox_data():
     logging.basicConfig(level=logging.INFO)
     log = logging.getLogger(__name__)
@@ -357,46 +370,29 @@ def transform_bbox_data():
     if os.path.exists(final_path):
         log.info(f"Archivo {final_path} ya existe. Omitiendo transform_bbox_data().")
         return
-    
+
     files = glob.glob(os.path.join(raw_folder, "bbox*_osm.csv"))
 
+    # Geocoder con detalles estructurados
     geolocator = Nominatim(user_agent="bbox_locator")
-    geocode = RateLimiter(geolocator.reverse, min_delay_seconds=1)
+    geocode = RateLimiter(
+        lambda coords: geolocator.reverse(coords, exactly_one=True, addressdetails=True),
+        min_delay_seconds=1
+    )
 
     def map_traffic_signal(val):
-        ts_values = ["traffic_lights", "signal", "pedestrian_crossing", "ramp_meter", "level_crossing", "emergency", "bridge"]
+        ts_values = ["traffic_lights", "signal", "pedestrian_crossing", "ramp_meter", 
+                     "level_crossing", "emergency", "bridge"]
         v = str(val).strip().lower()
         return v if v in ts_values else "unknown"
 
     def map_crossing(val):
-        crossing_values = ["uncontrolled", "marked", "unmarked", "zebra", "pelican", "puffin", "toucan"]
+        crossing_values = ["uncontrolled", "marked", "unmarked", "zebra", 
+                           "pelican", "puffin", "toucan"]
         v = str(val).strip().lower()
         if ";" in v:
             return "combinations"
         return v if v in crossing_values else "unknown"
-
-    def parse_approx_city(address):
-        if address == "Not found" or pd.isna(address):
-            return {"city": None, "county": None, "state": None, "postcode": None}
-        parts = [p.strip() for p in address.split(",")]
-        city, county, state, postcode = None, None, None, None
-        if len(parts) >= 5:
-            city = parts[1]
-            county = parts[2]
-            state = parts[3]
-            if parts[4].isdigit() or len(parts[4]) == 5:
-                postcode = parts[4]
-        elif len(parts) == 4:
-            city = parts[0]
-            county = parts[1]
-            state = parts[2]
-        elif len(parts) == 3:
-            city = parts[0]
-            county = parts[1]
-            state = parts[2]
-        else:
-            city = parts[0]
-        return {"city": city, "county": county, "state": state, "postcode": postcode}
 
     summary_list = []
     bbox_city_map = {}
@@ -408,16 +404,24 @@ def transform_bbox_data():
         except ValueError:
             lat, lng = None, None
 
+        # Geocodificación estructurada
         if lat is not None and lng is not None:
             try:
-                location = geocode(f"{lat}, {lng}", exactly_one=True)
-                if location:
-                    bbox_city_map[bbox_label] = location.address
+                loc = geocode(f"{lat}, {lng}")
+                if loc and "address" in loc.raw:
+                    addr = loc.raw["address"]
+                    bbox_city_map[bbox_label] = {
+                        "city": addr.get("city") or addr.get("town") \
+                                  or addr.get("village") or addr.get("hamlet"),
+                        "county": addr.get("county"),
+                        "state": addr.get("state"),
+                        "postcode": addr.get("postcode")
+                    }
                 else:
-                    bbox_city_map[bbox_label] = "Not found"
+                    bbox_city_map[bbox_label] = {"city": "unknown", "county": "unknown", "state": "unknown", "postcode": None}
             except Exception as e:
                 log.error(f"Error geocoding bbox {bbox_label}: {e}")
-                bbox_city_map[bbox_label] = "Error geocoding"
+                bbox_city_map[bbox_label] = {"city": "unknown", "county": "unknown", "state": "unknown", "postcode": None}
 
         df = pd.read_csv(file)
         df["tags"] = df["tags"].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else {})
@@ -426,11 +430,12 @@ def transform_bbox_data():
         df_cleaned.fillna("unknown", inplace=True)
         df_filtered = df_cleaned[df_cleaned["category"].isin(["school", "hospital", "traffic_signals", "crossing"])].copy()
 
-        group_school_hospital = df_filtered[df_filtered["category"].isin(["school", "hospital"])] \
-            .groupby("category").size().reset_index(name="count")
-        group_school_hospital.rename(columns={"category": "value"}, inplace=True)
-        group_school_hospital["group"] = "category"
+        # Conteo de schools y hospitals
+        group_sh = df_filtered[df_filtered["category"].isin(["school", "hospital"])].groupby("category").size().reset_index(name="count")
+        group_sh.rename(columns={"category": "value"}, inplace=True)
+        group_sh["group"] = "category"
 
+        # Conteo de traffic_signals
         df_ts = df_filtered[df_filtered["category"] == "traffic_signals"].copy()
         if not df_ts.empty and "traffic_signals" in df_ts.columns:
             df_ts["mapped"] = df_ts["traffic_signals"].apply(map_traffic_signal)
@@ -440,46 +445,65 @@ def transform_bbox_data():
         else:
             group_ts = pd.DataFrame(columns=["value", "count", "group"])
 
-        df_cross = df_filtered[df_filtered["category"] == "crossing"].copy()
-        if not df_cross.empty and "crossing" in df_cross.columns:
-            df_cross["mapped"] = df_cross["crossing"].apply(map_crossing)
-            group_cross = df_cross.groupby("mapped").size().reset_index(name="count")
-            group_cross.rename(columns={"mapped": "value"}, inplace=True)
-            group_cross["group"] = "crossing"
+        # Conteo de crossings
+        df_cr = df_filtered[df_filtered["category"] == "crossing"].copy()
+        if not df_cr.empty and "crossing" in df_cr.columns:
+            df_cr["mapped"] = df_cr["crossing"].apply(map_crossing)
+            group_cr = df_cr.groupby("mapped").size().reset_index(name="count")
+            group_cr.rename(columns={"mapped": "value"}, inplace=True)
+            group_cr["group"] = "crossing"
         else:
-            group_cross = pd.DataFrame(columns=["value", "count", "group"])
+            group_cr = pd.DataFrame(columns=["value", "count", "group"])
 
-        summary_bbox = pd.concat([group_school_hospital, group_ts, group_cross], ignore_index=True)
+        summary_bbox = pd.concat([group_sh, group_ts, group_cr], ignore_index=True)
         summary_bbox["bbox_label"] = bbox_label
         summary_list.append(summary_bbox)
 
+    # Consolidar y pivotar
     df_all = pd.concat(summary_list, ignore_index=True)
     pivot_df = df_all.pivot_table(index="bbox_label", columns=["group", "value"], values="count", fill_value=0)
     pivot_df.columns = [f"{grp}_{val}" for grp, val in pivot_df.columns]
     pivot_df.reset_index(inplace=True)
 
-    pivot_df["approx_city"] = pivot_df["bbox_label"].map(bbox_city_map)
+    # Agregar columnas de ubicación estructurada
+    addr_df = pivot_df["bbox_label"].map(bbox_city_map).apply(pd.Series)
+    addr_df["city"].fillna("unknown", inplace=True)
+    addr_df["county"].fillna("unknown", inplace=True)
+    addr_df["state"].fillna("unknown", inplace=True)
+    addr_df["postcode"].fillna("", inplace=True)
+    pivot_df[["city", "county", "state", "postcode"]] = addr_df[["city", "county", "state", "postcode"]]
 
-    parsed_data = pivot_df["approx_city"].apply(parse_approx_city).apply(pd.Series)
-    pivot_df = pd.concat([pivot_df, parsed_data], axis=1)
+    # Reordenar columnas según esquema deseado
+    cols_desired = [
+        "bbox_label",
+        "category_hospital", "category_school",
+        "crossing_combinations", "crossing_marked", "crossing_uncontrolled",
+        "crossing_unknown", "crossing_unmarked", "crossing_zebra",
+        "traffic_signals_bridge", "traffic_signals_emergency",
+        "traffic_signals_level_crossing", "traffic_signals_pedestrian_crossing",
+        "traffic_signals_ramp_meter", "traffic_signals_signal",
+        "traffic_signals_traffic_lights", "traffic_signals_unknown",
+        "city", "county", "state", "postcode"
+    ]
+    # Algunos pivots podrían faltar si no hay datos; aseguramos existencia
+    existing_cols = [c for c in cols_desired if c in pivot_df.columns]
+    pivot_df = pivot_df[existing_cols]
 
+    # Guardar resultado final
     os.makedirs(processed_folder, exist_ok=True)
-    output_path = os.path.join(processed_folder, "combined_bbox_summary_final.csv")
-    pivot_df.to_csv(output_path, index=False)
-    log.info(f"Archivo final guardado en '{output_path}'")
+    pivot_df.to_csv(final_path, index=False)
+    log.info(f"Archivo final guardado en '{final_path}'")
+
 
 def merge_accidents_with_api():
-    from sqlalchemy import create_engine, text
-    import pandas as pd
-    import logging
-
     log = logging.getLogger(__name__)
     source_engine = create_engine(SOURCE_DB_URL)
-
+    processed_folder = "/opt/airflow/data/processed/"
     try:
+        # --- Crear tabla de destino si no existe ---
         with source_engine.begin() as conn:
-            log.info("Creando tabla accidentes_final si no existe...")
-            create_table_sql = """
+            log.info("Creando tabla 'accidentes_final' si no existe...")
+            create_sql = """
             CREATE TABLE IF NOT EXISTS accidentes_final (
                 id INTEGER PRIMARY KEY,
                 crash_date TIMESTAMP,
@@ -496,7 +520,7 @@ def merge_accidents_with_api():
                 damage TEXT,
                 prim_contributory_cause TEXT,
                 num_units INT,
-                most_severe_injury VARCHAR,
+                most_severe_injury TEXT,
                 injuries_total FLOAT,
                 injuries_fatal FLOAT,
                 injuries_incapacitating FLOAT,
@@ -533,82 +557,117 @@ def merge_accidents_with_api():
                 aprox_postcode TEXT
             );
             """
-            conn.execute(text(create_table_sql))
+            conn.execute(text(create_sql))
 
+        # --- Cargar datos de accidentes ---
         with source_engine.connect() as conn:
-            log.info("Consultando datos de accidentes...")
+            log.info("Leyendo 'accidentes' desde base de datos...")
             result = conn.execute(text("SELECT * FROM accidentes"))
             rows = result.fetchall()
-            columns = result.keys()
-            df_accidents = pd.DataFrame(rows, columns=columns)
+            cols = result.keys()
+            df_acc = pd.DataFrame(rows, columns=cols)
 
-            log.info("Leyendo archivo CSV de la API...")
-            api_df = pd.read_csv("data/processed/combined_bbox_summary_final.csv")
+            # --- Leer CSV procesado ---
+            log.info("Leyendo CSV de API: combined_bbox_summary_final.csv...")
+            api_df = pd.read_csv(
+                os.path.join(processed_folder, 'combined_bbox_summary_final.csv'),
+                dtype={
+                    'category_hospital': 'Int64',
+                    'category_school': 'Int64'
+                }
+            )
 
-            # Procesamiento
-            df_accidents['start_lat'] = df_accidents['start_lat'].astype(float)
-            df_accidents['start_lng'] = df_accidents['start_lng'].astype(float)
-            df_accidents['lat_bin'] = (df_accidents['start_lat'] // 0.5) * 0.5
-            df_accidents['lng_bin'] = (df_accidents['start_lng'] // 0.5) * 0.5
-            df_accidents['bbox_label'] = 'bbox_' + df_accidents['lat_bin'].astype(str) + '_' + df_accidents['lng_bin'].astype(str)
-
+            # Rebautizar columnas de ubicación para coincidir
             api_df = api_df.rename(columns={
-                "city": "aprox_city",
-                "county": "aprox_county",
-                "state": "aprox_state",
-                "postcode": "aprox_postcode"
+                'city': 'aprox_city',
+                'county': 'aprox_county',
+                'state': 'aprox_state',
+                'postcode': 'aprox_postcode'
             })
 
-            log.info("Realizando merge con datos de la API...")
-            merged_df = pd.merge(df_accidents, api_df, on="bbox_label", how="inner")
+            # Convertir recuentos a enteros (si vienen como floats)
+            count_cols = [
+                'category_hospital','category_school',
+                'crossing_combinations','crossing_marked','crossing_uncontrolled',
+                'crossing_unknown','crossing_unmarked','crossing_zebra',
+                'traffic_signals_bridge','traffic_signals_emergency',
+                'traffic_signals_level_crossing','traffic_signals_pedestrian_crossing',
+                'traffic_signals_ramp_meter','traffic_signals_signal',
+                'traffic_signals_traffic_lights','traffic_signals_unknown'
+            ]
+            for c in count_cols:
+                if c in api_df.columns:
+                    api_df[c] = api_df[c].fillna(0).astype(int)
 
-            log.info("Verificando registros ya existentes en accidentes_final...")
-            result_ids = conn.execute(text("SELECT id FROM accidentes_final"))
-            existing_ids = set(row[0] for row in result_ids.fetchall())
-            merged_df = merged_df[~merged_df["id"].isin(existing_ids)]
+            # Reemplazar cadenas vacías por None
+            api_df[['aprox_city','aprox_county','aprox_state','aprox_postcode']] = \
+                api_df[['aprox_city','aprox_county','aprox_state','aprox_postcode']].replace({'': None})
 
-            if merged_df.empty:
-                log.info("No hay registros nuevos para insertar.")
+            # --- Preprocesamiento de coordenadas en df_acc ---
+            df_acc['start_lat'] = df_acc['start_lat'].astype(float)
+            df_acc['start_lng'] = df_acc['start_lng'].astype(float)
+            df_acc['lat_bin'] = (df_acc['start_lat'] // 0.5) * 0.5
+            df_acc['lng_bin'] = (df_acc['start_lng'] // 0.5) * 0.5
+            df_acc['bbox_label'] = 'bbox_' + df_acc['lat_bin'].astype(str) + '_' + df_acc['lng_bin'].astype(str)
+
+            # --- Merge interno ---
+            log.info("Realizando INNER JOIN sobre 'bbox_label'...")
+            merged = pd.merge(df_acc, api_df, on='bbox_label', how='inner')
+            log.info(f"Registros tras merge: {len(merged)}")
+
+            # --- Filtrar nuevos registros ---
+            existing = conn.execute(text("SELECT id FROM accidentes_final")).fetchall()
+            existing_ids = set(r[0] for r in existing)
+            new_df = merged[~merged['id'].isin(existing_ids)].copy()
+            log.info(f"Nuevos registros a insertar: {len(new_df)}")
+            if new_df.empty:
                 return
 
-            columnas_finales = [
-                "id", "crash_date", "traffic_control_device", "weather_condition", "lighting_condition",
-                "first_crash_type", "trafficway_type", "alignment", "roadway_surface_cond", "road_defect",
-                "crash_type", "intersection_related", "damage", "prim_contributory_cause", "num_units",
-                "most_severe_injury", "injuries_total", "injuries_fatal", "injuries_incapacitating",
-                "injuries_non_incapacitating", "injuries_reported_not_evident", "injuries_no_indication",
-                "crash_hour", "crash_day_of_week", "crash_month", "start_lat", "start_lng",
-                "lat_bin", "lng_bin", "bbox_label", "category_hospital", "category_school",
-                "crossing_combinations", "crossing_marked", "crossing_uncontrolled", "crossing_unknown",
-                "crossing_unmarked", "crossing_zebra", "traffic_signals_bridge", "traffic_signals_emergency",
-                "traffic_signals_level_crossing", "traffic_signals_pedestrian_crossing",
-                "traffic_signals_ramp_meter", "traffic_signals_signal", "traffic_signals_traffic_lights",
-                "traffic_signals_unknown", "aprox_city", "aprox_county", "aprox_state", "aprox_postcode"
+            # --- Definir orden de columnas ---
+            cols_final = [
+                'id','crash_date','traffic_control_device','weather_condition','lighting_condition',
+                'first_crash_type','trafficway_type','alignment','roadway_surface_cond','road_defect',
+                'crash_type','intersection_related','damage','prim_contributory_cause','num_units',
+                'most_severe_injury','injuries_total','injuries_fatal','injuries_incapacitating',
+                'injuries_non_incapacitating','injuries_reported_not_evident','injuries_no_indication',
+                'crash_hour','crash_day_of_week','crash_month','start_lat','start_lng',
+                'lat_bin','lng_bin','bbox_label'
+            ] + count_cols + [
+                'aprox_city','aprox_county','aprox_state','aprox_postcode'
             ]
-            merged_df = merged_df[columnas_finales]
+            new_df = new_df[cols_final]
 
-            log.info(f"Insertando {len(merged_df)} registros nuevos en accidentes_final...")
-            insert_query = f"""
-                INSERT INTO accidentes_final ({', '.join(columnas_finales)})
-                VALUES ({', '.join([f':{col}' for col in columnas_finales])})
-                ON CONFLICT (id) DO NOTHING;
-            """
-            for _, row in merged_df.iterrows():
-                conn.execute(text(insert_query), row.to_dict())
+            # --- Insertar registros ---
+            insert_sql = f"INSERT INTO accidentes_final ({', '.join(cols_final)}) " \
+                         + "VALUES ({}) ON CONFLICT (id) DO NOTHING".format(
+                ', '.join(':'+col for col in cols_final)
+            )
+
+            inserted = 0
+            for _, row in new_df.iterrows():
+                record = row.where(pd.notnull(row), None).to_dict()
+                try:
+                    conn.execute(text(insert_sql), record)
+                    inserted += 1
+                except Exception as e:
+                    log.warning(f"Error insertando ID {record.get('id')}: {e}")
+            log.info(f"Total insertados: {inserted} de {len(new_df)}")
 
     except Exception as e:
-        log.error(f"Error en merge_accidents_with_api: {str(e)}", exc_info=True)
+        log.error(f"Error en merge_accidents_with_api: {e}", exc_info=True)
         raise
 
     finally:
         source_engine.dispose()
-        log.info("Conexión cerrada.")
+        log.info("Conexión finalizada.")
+
 
 
 def load_from_accidentes_final():
     log = logging.getLogger(__name__)
     source_engine = dim_engine = None
     source_conn = dim_conn = None
+
     try:
         source_engine = create_engine(SOURCE_DB_URL)
         dim_engine = create_engine(DIM_DB_URL)
@@ -622,7 +681,6 @@ def load_from_accidentes_final():
             log.info("No hay datos en accidentes_final. Finalizando función.")
             return
 
-        # Verificamos si ya hay datos en dim_fecha
         result = dim_conn.execute(text("SELECT COUNT(*) FROM dim_fecha"))
         dim_fecha_count = result.scalar()
 
@@ -631,141 +689,104 @@ def load_from_accidentes_final():
 
         if dim_fecha_count == 0:
             log.info("Insertando dimensiones en lote...")
-            dim_conn.execute(text("""INSERT INTO dim_fecha (Día, Mes, Año, Día_Semana, Hora) VALUES (:dia, :mes, :ano, :dia_semana, :hora) ON CONFLICT DO NOTHING"""),
-                [{
-                    "dia": row.crash_date.day,
-                    "mes": row.crash_date.month,
-                    "ano": row.crash_date.year,
-                    "dia_semana": row.crash_date.strftime("%A"),
-                    "hora": row.crash_date.time()
-                } for row in rows])
 
-            dim_conn.execute(text("""INSERT INTO dim_ubicacion (Latitud, Longitud, Intersección, Approx_City, Approx_County, Approx_State, Approx_Postcode)
-                       VALUES (:lat, :lng, :inter, :city, :county, :state, :postcode) ON CONFLICT DO NOTHING"""),
-                [{
-                    "lat": row.start_lat,
-                    "lng": row.start_lng,
-                    "inter": row.intersection_related,
-                    "city": row.aprox_city,
-                    "county": row.aprox_county,
-                    "state": row.aprox_state,
-                    "postcode": row.aprox_postcode
-                } for row in rows])
-
-            dim_conn.execute(text("""INSERT INTO dim_clima (Condición_Climática) VALUES (:cond) ON CONFLICT DO NOTHING"""),
-                [{"cond": row.weather_condition} for row in rows])
-
-            dim_conn.execute(text("""INSERT INTO dim_iluminacion (Condición_Iluminación) VALUES (:cond) ON CONFLICT DO NOTHING"""),
-                [{"cond": row.lighting_condition} for row in rows])
-
-            dim_conn.execute(text("""INSERT INTO dim_contribuyente_principal (Causa_Principal) VALUES (:causa) ON CONFLICT DO NOTHING"""),
-                [{"causa": row.prim_contributory_cause} for row in rows])
-
-            dim_conn.execute(text("""INSERT INTO dim_condicion_camino (Superficie_Carretera, Defecto_Carretera)
-                       VALUES (:superf, :defec) ON CONFLICT DO NOTHING"""),
-                [{"superf": row.roadway_surface_cond, "defec": row.road_defect} for row in rows])
-
-            dim_conn.execute(text("""INSERT INTO dim_tipo_accidente (Tipo_Primer_Choque, Tipo_Vía, Alineación, Nivel_Lesión)
-                       VALUES (:choque, :via, :alinea, :lesion) ON CONFLICT DO NOTHING"""),
-                [{
-                    "choque": row.first_crash_type,
-                    "via": row.trafficway_type,
-                    "alinea": row.alignment,
-                    "lesion": row.most_severe_injury
-                } for row in rows])
-
-            dim_conn.execute(text("""INSERT INTO dim_infraestructura (
-                BBox_Label, Category_Hospital, Category_School, Crossing_Combinations,
-                Crossing_Marked, Crossing_Uncontrolled, Crossing_Unknown, Crossing_Unmarked,
-                Crossing_Zebra, Traffic_Signals_Bridge, Traffic_Signals_Emergency,
-                Traffic_Signals_Level_Crossing, Traffic_Signals_Pedestrian_Crossing,
-                Traffic_Signals_Ramp_Meter, Traffic_Signals_Signal, Traffic_Signals_Traffic_Lights,
-                Traffic_Signals_Unknown) 
-                VALUES (
-                :bbox, :hosp, :school, :comb, :marked, :uncontrolled, :unknown, :unmarked,
-                :zebra, :bridge, :emerg, :level, :pedes, :ramp, :signal, :traffic, :ts_unknown) 
-                ON CONFLICT DO NOTHING"""),
-                [{
-                    "bbox": row.bbox_label,
-                    "hosp": row.category_hospital,
-                    "school": row.category_school,
-                    "comb": row.crossing_combinations,
-                    "marked": row.crossing_marked,
-                    "uncontrolled": row.crossing_uncontrolled,
-                    "unknown": row.crossing_unknown,
-                    "unmarked": row.crossing_unmarked,
-                    "zebra": row.crossing_zebra,
-                    "bridge": row.traffic_signals_bridge,
-                    "emerg": row.traffic_signals_emergency,
-                    "level": row.traffic_signals_level_crossing,
-                    "pedes": row.traffic_signals_pedestrian_crossing,
-                    "ramp": row.traffic_signals_ramp_meter,
-                    "signal": row.traffic_signals_signal,
-                    "traffic": row.traffic_signals_traffic_lights,
-                    "ts_unknown": row.traffic_signals_unknown
-                } for row in rows])
-
-        log.info("Dimensiones listas. Preparando inserción en hechos_accidentes...")
-        hechos_batch = []
-        for row in rows:
-            hechos_batch.append({
-                "id": row.id,
+            dim_conn.execute(text("""
+                INSERT INTO dim_fecha (Día, Mes, Año, Día_Semana, Hora)
+                VALUES (:dia, :mes, :ano, :dia_semana, :hora)
+                ON CONFLICT DO NOTHING
+            """), [{
                 "dia": row.crash_date.day,
                 "mes": row.crash_date.month,
                 "ano": row.crash_date.year,
                 "dia_semana": row.crash_date.strftime("%A"),
-                "hora": row.crash_date.time(),
+                "hora": row.crash_date.time()
+            } for row in rows])
+
+            dim_conn.execute(text("""
+                INSERT INTO dim_ubicacion (Latitud, Longitud, Intersección, Approx_City, Approx_County, Approx_State, Approx_Postcode)
+                VALUES (:lat, :lng, :inter, :city, :county, :state, :postcode)
+                ON CONFLICT DO NOTHING
+            """), [{
                 "lat": row.start_lat,
                 "lng": row.start_lng,
                 "inter": row.intersection_related,
                 "city": row.aprox_city,
                 "county": row.aprox_county,
                 "state": row.aprox_state,
-                "postcode": row.aprox_postcode,
-                "weather": row.weather_condition,
-                "light": row.lighting_condition,
+                "postcode": row.aprox_postcode
+            } for row in rows])
+
+            dim_conn.execute(text("""
+                INSERT INTO dim_clima (Condición_Climática)
+                VALUES (:cond)
+                ON CONFLICT DO NOTHING
+            """), [{"cond": row.weather_condition} for row in rows])
+
+            dim_conn.execute(text("""
+                INSERT INTO dim_iluminacion (Condición_Iluminación)
+                VALUES (:cond)
+                ON CONFLICT DO NOTHING
+            """), [{"cond": row.lighting_condition} for row in rows])
+
+            dim_conn.execute(text("""
+                INSERT INTO dim_contribuyente_principal (Causa_Principal)
+                VALUES (:causa)
+                ON CONFLICT DO NOTHING
+            """), [{"causa": row.prim_contributory_cause} for row in rows])
+
+            dim_conn.execute(text("""
+                INSERT INTO dim_condicion_camino (Superficie_Carretera, Defecto_Carretera)
+                VALUES (:superf, :defec)
+                ON CONFLICT DO NOTHING
+            """), [{
                 "superf": row.roadway_surface_cond,
-                "defect": row.road_defect,
+                "defec": row.road_defect
+            } for row in rows])
+
+            dim_conn.execute(text("""
+                INSERT INTO dim_tipo_accidente (Tipo_Primer_Choque, Tipo_Vía, Alineación, Nivel_Lesión)
+                VALUES (:choque, :via, :alinea, :lesion)
+                ON CONFLICT DO NOTHING
+            """), [{
                 "choque": row.first_crash_type,
                 "via": row.trafficway_type,
                 "alinea": row.alignment,
-                "lesion": row.most_severe_injury,
-                "causa": row.prim_contributory_cause,
-                "units": row.num_units,
-                "total": row.injuries_total,
-                "fatal": row.injuries_fatal,
-                "incap": row.injuries_incapacitating,
-                "no_incap": row.injuries_non_incapacitating,
-                "report": row.injuries_reported_not_evident,
-                "none": row.injuries_no_indication
-            })
+                "lesion": row.most_severe_injury
+            } for row in rows])
 
-        for row in hechos_batch:
             dim_conn.execute(text("""
-                INSERT INTO hechos_accidentes (
-                    ID_Hecho, Fecha_ID, Ubicación_ID, Clima_ID, Iluminación_ID,
-                    Condición_Camino_ID, Tipo_Accidente_ID, Contribuyente_Principal_ID,
-                    Unidades_Involucradas, Total_Lesiones, Fatalidades, Incapacitantes,
-                    No_Incapacitantes, Reportadas_No_Evidentes, Sin_Indicación
-                )
-                SELECT :id, f.Fecha_ID, u.Ubicación_ID, c.Clima_ID, i.Iluminación_ID,
-                       cc.Condición_Camino_ID, t.Tipo_Accidente_ID, cp.Contribuyente_Principal_ID,
-                       :units, :total, :fatal, :incap, :no_incap, :report, :none
-                FROM dim_fecha f, dim_ubicacion u, dim_clima c, dim_iluminacion i,
-                     dim_condicion_camino cc, dim_tipo_accidente t, dim_contribuyente_principal cp
-                WHERE
-                    f.Día = :dia AND f.Mes = :mes AND f.Año = :ano AND f.Día_Semana = :dia_semana AND f.Hora = :hora AND
-                    u.Latitud = :lat AND u.Longitud = :lng AND u.Intersección = :inter AND
-                    u.Approx_City = :city AND u.Approx_County = :county AND u.Approx_State = :state AND u.Approx_Postcode = :postcode AND
-                    c.Condición_Climática = :weather AND
-                    i.Condición_Iluminación = :light AND
-                    cc.Superficie_Carretera = :superf AND cc.Defecto_Carretera = :defect AND
-                    t.Tipo_Primer_Choque = :choque AND t.Tipo_Vía = :via AND t.Alineación = :alinea AND t.Nivel_Lesión = :lesion AND
-                    cp.Causa_Principal = :causa
-                ON CONFLICT DO NOTHING
-            """), row)
+                INSERT INTO dim_infraestructura (
+                    BBox_Label, Category_Hospital, Category_School, Crossing_Combinations,
+                    Crossing_Marked, Crossing_Uncontrolled, Crossing_Unknown, Crossing_Unmarked,
+                    Crossing_Zebra, Traffic_Signals_Bridge, Traffic_Signals_Emergency,
+                    Traffic_Signals_Level_Crossing, Traffic_Signals_Pedestrian_Crossing,
+                    Traffic_Signals_Ramp_Meter, Traffic_Signals_Signal, Traffic_Signals_Traffic_Lights,
+                    Traffic_Signals_Unknown
+                ) VALUES (
+                    :bbox, :hosp, :school, :comb, :marked, :uncontrolled, :unknown, :unmarked,
+                    :zebra, :bridge, :emerg, :level, :pedes, :ramp, :signal, :traffic, :ts_unknown
+                ) ON CONFLICT DO NOTHING
+            """), [{
+                "bbox": row.bbox_label,
+                "hosp": row.category_hospital,
+                "school": row.category_school,
+                "comb": row.crossing_combinations,
+                "marked": row.crossing_marked,
+                "uncontrolled": row.crossing_uncontrolled,
+                "unknown": row.crossing_unknown,
+                "unmarked": row.crossing_unmarked,
+                "zebra": row.crossing_zebra,
+                "bridge": row.traffic_signals_bridge,
+                "emerg": row.traffic_signals_emergency,
+                "level": row.traffic_signals_level_crossing,
+                "pedes": row.traffic_signals_pedestrian_crossing,
+                "ramp": row.traffic_signals_ramp_meter,
+                "signal": row.traffic_signals_signal,
+                "traffic": row.traffic_signals_traffic_lights,
+                "ts_unknown": row.traffic_signals_unknown
+            } for row in rows])
 
-        log.info("Carga completa desde accidentes_final.")
+        log.info("Dimensiones cargadas correctamente desde accidentes_final.")
 
     except Exception as e:
         log.error(f"Error en load_from_accidentes_final: {str(e)}", exc_info=True)
@@ -781,6 +802,7 @@ def load_from_accidentes_final():
         if dim_engine:
             dim_engine.dispose()
         log.info("Conexiones cerradas.")
+
 
 def insert_hechos_accidentes_optimizado(rows, dim_conn):
     log = logging.getLogger(__name__)
@@ -823,6 +845,10 @@ def insert_hechos_accidentes_optimizado(rows, dim_conn):
         "SELECT contribuyente_principal_id, causa_principal FROM dim_contribuyente_principal",
         ["causa_principal"], "contribuyente_principal_id")
 
+    infraestructura_dict = build_dict(
+        "SELECT infraestructura_id, bbox_label FROM dim_infraestructura",
+        ["bbox_label"], "infraestructura_id")
+
     log.info("Construyendo registros para hechos_accidentes...")
     hechos_batch = []
 
@@ -848,6 +874,7 @@ def insert_hechos_accidentes_optimizado(rows, dim_conn):
                 row.alignment, row.most_severe_injury
             )),
             "contribuyente_id": causa_dict.get((row.prim_contributory_cause,)),
+            "infraestructura_id": infraestructura_dict.get((row.bbox_label,)),
             "unidades": row.num_units,
             "total_lesiones": row.injuries_total,
             "fatalidades": row.injuries_fatal,
@@ -862,11 +889,13 @@ def insert_hechos_accidentes_optimizado(rows, dim_conn):
         INSERT INTO hechos_accidentes (
             id_hecho, fecha_id, ubicación_id, clima_id, iluminación_id,
             condición_camino_id, tipo_accidente_id, contribuyente_principal_id,
+            infraestructura_id,
             unidades_involucradas, total_lesiones, fatalidades, incapacitantes,
             no_incapacitantes, reportadas_no_evidentes, sin_indicación
         ) VALUES (
             :id, :fecha_id, :ubicacion_id, :clima_id, :iluminacion_id,
             :condicion_camino_id, :tipo_accidente_id, :contribuyente_id,
+            :infraestructura_id,
             :unidades, :total_lesiones, :fatalidades, :incapacitantes,
             :no_incapacitantes, :reportadas_no_evidentes, :sin_indicacion
         )
@@ -955,14 +984,14 @@ with DAG(
     )
 
     task_load = PythonOperator(
-        task_id='load',
+        task_id='load_dimensiones',
         python_callable=load_from_accidentes_final,
         provide_context=True,
         trigger_rule=TriggerRule.ALL_SUCCESS  
     )
 
     task_insert_hechos = PythonOperator(
-        task_id='insert_hechos',
+        task_id='load_hechos',
         python_callable=task_insert_hechos_accidentes_optimizado,
         provide_context=True,
         trigger_rule=TriggerRule.ALL_SUCCESS  
